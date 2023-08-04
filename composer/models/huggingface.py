@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import copy
 import logging
 import tempfile
 import textwrap
@@ -24,10 +25,59 @@ if TYPE_CHECKING:
     import transformers
     from transformers import PretrainedConfig
     from transformers.models.auto.auto_factory import _BaseAutoModelClass
+from tokenizers import AddedToken
 
 log = logging.getLogger(__name__)
 
 __all__ = ['HuggingFaceModel']
+
+
+def get_tokenizer_content(tokenizer):
+  tokenizer_config = copy.deepcopy(tokenizer.init_kwargs)
+
+  target_keys = ["model_max_length", "clean_up_tokenization_spaces"]
+  for k in target_keys:
+      if hasattr(tokenizer, k):
+          tokenizer_config[k] = getattr(tokenizer, k)
+
+  if len(tokenizer.init_inputs) > 0:
+      tokenizer_config["init_inputs"] = copy.deepcopy(tokenizer.init_inputs)
+  for file_id in tokenizer.vocab_files_names.keys():
+      tokenizer_config.pop(file_id, None)
+
+  def convert_added_tokens(obj, add_type_field=True):
+      if isinstance(obj, AddedToken):
+          out = obj.__getstate__()
+          if add_type_field:
+              out["__type"] = "AddedToken"
+          return out
+      elif isinstance(obj, (list, tuple)):
+          return [convert_added_tokens(o, add_type_field=add_type_field) for o in obj]
+      elif isinstance(obj, dict):
+          return {k: convert_added_tokens(v, add_type_field=add_type_field) for k, v in obj.items()}
+      return obj
+
+  tokenizer_config = convert_added_tokens(tokenizer_config, add_type_field=True)
+
+  tokenizer_class = tokenizer.__class__.__name__
+  if tokenizer_class.endswith("Fast") and tokenizer_class != "PreTrainedTokenizerFast":
+      tokenizer_class = tokenizer_class[:-4]
+  tokenizer_config["tokenizer_class"] = tokenizer_class
+  if getattr(tokenizer, "_auto_map", None) is not None:
+      tokenizer_config["auto_map"] = tokenizer._auto_map
+  if getattr(tokenizer, "_processor_class", None) is not None:
+      tokenizer_config["processor_class"] = tokenizer._processor_class
+
+  if "name_or_path" in tokenizer_config:
+      tokenizer_config.pop("name_or_path")
+      tokenizer_config.pop("special_tokens_map_file", None)
+
+  special_tokens_map = convert_added_tokens(tokenizer.special_tokens_map_extended, add_type_field=False)
+
+  tokenizer_map = json.loads(tokenizer.backend_tokenizer.to_str())
+
+  tokenizer_content = (tokenizer_config, special_tokens_map, tokenizer_map)
+  return tokenizer_content
 
 
 class HuggingFaceModel(ComposerModel):
@@ -458,6 +508,7 @@ class HuggingFaceModel(ComposerModel):
             }
 
             if self.tokenizer is not None:
+                tokenizer_config, special_tokens_map, tokenizer_map = get_tokenizer_content(self.tokenizer)
                 for tokenizer_file_name in tokenizer_dir.iterdir():
                     tokenizer_file_path = tokenizer_dir / tokenizer_file_name
                     tokenizer_file_extension = tokenizer_file_path.suffix
@@ -466,7 +517,13 @@ class HuggingFaceModel(ComposerModel):
                             tokenizer_file_content = _tokenizer_file.read().split('\n')
                     elif tokenizer_file_extension == '.json':
                         with open(tokenizer_file_path) as _tokenizer_file:
-                            tokenizer_file_content = json.load(_tokenizer_file)
+                            # tokenizer_file_content = json.load(_tokenizer_file)
+                            if 'tokenizer.json' in tokenizer_file_path.name:
+                                tokenizer_file_content = tokenizer_map
+                            elif 'tokenizer_config.json' in tokenizer_file_path.name:
+                                tokenizer_file_content = tokenizer_config
+                            elif 'special_tokens_map.json' in tokenizer_file_path.name:
+                                tokenizer_file_content = special_tokens_map
                     elif tokenizer_file_extension == '.py':
                         with open(tokenizer_file_path) as _tokenizer_file:
                             tokenizer_file_content = _tokenizer_file.read()
